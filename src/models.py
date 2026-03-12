@@ -131,7 +131,36 @@ class TextBlock:
                 parts.append(span.text)
             line_texts.append("".join(parts))
 
-        return " ".join(line_texts)
+        # --- Phase 2: join visual lines into continuous prose ---
+        # PDF visual lines are NOT logical line breaks — they're just
+        # where text wraps on the page.  Strip \r\n, rejoin hyphenated
+        # words, and collapse into a single flowing paragraph.
+        joined_lines: list[str] = []
+        for lt in line_texts:
+            # Strip trailing/leading whitespace and CR/LF
+            cleaned = lt.replace("\r\n", "").replace("\r", "").replace("\n", "").strip()
+            if cleaned:
+                joined_lines.append(cleaned)
+
+        # Rejoin: if a line ends mid-word (last char is a letter, next
+        # line starts with a lowercase letter), join without space.
+        result_parts: list[str] = []
+        for i, line_str in enumerate(joined_lines):
+            if i > 0 and result_parts:
+                prev = result_parts[-1]
+                # Hyphenated word break: "over-\n whelming" → "overwhelming"
+                if prev.endswith("-"):
+                    result_parts[-1] = prev[:-1]  # remove trailing hyphen
+                # If previous line ends with a letter and current starts
+                # with a lowercase letter, the word was split across lines
+                elif (prev and prev[-1].isalpha()
+                      and line_str and line_str[0].islower()):
+                    result_parts.append(" ")
+                else:
+                    result_parts.append(" ")
+            result_parts.append(line_str)
+
+        return "".join(result_parts)
 
     @property
     def primary_font(self) -> FontInfo:

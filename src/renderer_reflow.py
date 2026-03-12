@@ -387,36 +387,109 @@ class ReflowRenderer:
         block_role = self._classify_block(tblock)
 
         if is_ar:
-            # IMPORTANT: Only reshape (positional letter forms), do NOT
-            # apply BiDi reordering.  ReportLab's Paragraph with
-            # wordWrap='RTL' handles visual line ordering internally.
-            # Applying full BiDi here would reverse the entire paragraph
-            # string, causing last-sentence-first rendering.
-            display_text = reshape_arabic(text)
+            # Arabic rendering pipeline:
+            # 1. Reshape letters to positional forms (connected glyphs)
+            # 2. Word-wrap to fit page width
+            # 3. Apply BiDi reordering PER LINE (not per paragraph!)
+            # 4. Join lines with <br/> for Paragraph
+            #
+            # Why per-line BiDi? The built-in BiDi reverses the entire
+            # string.  For a full paragraph, this puts the last sentence
+            # first.  But for a single wrapped line, it correctly converts
+            # logical order → visual order for RTL display.
+            display_text = self._prepare_arabic_paragraph(text, block_role)
             style_key = {
                 "title": "ar_title",
                 "heading": "ar_heading",
                 "body": "ar_body",
             }[block_role]
         else:
-            display_text = text
+            display_text = self._esc(text)
             style_key = "en_body"
 
-        escaped = self._esc(display_text)
-
         try:
-            return Paragraph(escaped, self._styles[style_key])
+            return Paragraph(display_text, self._styles[style_key])
         except Exception as e:
             logger.warning(f"Paragraph creation failed: {e}")
-            # Strip control characters and retry
             safe = "".join(
-                ch for ch in escaped
+                ch for ch in display_text
                 if unicodedata.category(ch)[0] != "C" or ch in "\n\r\t"
             )
             try:
                 return Paragraph(safe, self._styles[style_key])
             except Exception:
                 return None
+
+    def _prepare_arabic_paragraph(self, text: str, role: str) -> str:
+        """
+        Prepare Arabic text for a Platypus Paragraph:
+        reshape → word-wrap → per-line BiDi → join with <br/>.
+        """
+        from .arabic_utils import reshape_arabic, bidi_reorder
+
+        # Step 1: reshape (connected letter forms)
+        reshaped = reshape_arabic(text)
+
+        # Step 2: determine max width and font for this role
+        cfg = self.config
+        if role == "title":
+            font_name = self._font_bold
+            font_size = cfg.font_size * cfg.title_scale
+        elif role == "heading":
+            font_name = self._font_bold
+            font_size = cfg.font_size * cfg.heading_scale
+        else:
+            font_name = self._font_reg
+            font_size = cfg.font_size
+
+        usable_width = (
+            cfg.page_size[0] - cfg.margin_left - cfg.margin_right
+        )
+
+        # Step 3: word-wrap
+        wrapped_lines = self._wrap_arabic_text(
+            reshaped, font_name, font_size, usable_width
+        )
+
+        # Step 4: apply BiDi per line, escape for XML, join with <br/>
+        bidi_lines = []
+        for line in wrapped_lines:
+            reordered = bidi_reorder(line)
+            bidi_lines.append(self._esc(reordered))
+
+        return "<br/>".join(bidi_lines)
+
+    def _wrap_arabic_text(
+        self, text: str, font_name: str, font_size: float, max_width: float
+    ) -> list[str]:
+        """Word-wrap reshaped Arabic text to fit within max_width."""
+        import io as _io
+        from reportlab.pdfgen import canvas as _canvas
+
+        # Use a temporary canvas for width measurement
+        buf = _io.BytesIO()
+        c = _canvas.Canvas(buf, pagesize=self.config.page_size)
+
+        words = text.split()
+        if not words:
+            return [text] if text.strip() else []
+
+        lines: list[str] = []
+        current: list[str] = []
+
+        for word in words:
+            test_line = " ".join(current + [word])
+            width = c.stringWidth(test_line, font_name, font_size)
+            if width <= max_width or not current:
+                current.append(word)
+            else:
+                lines.append(" ".join(current))
+                current = [word]
+
+        if current:
+            lines.append(" ".join(current))
+
+        return lines
 
     def _classify_block(self, tblock: TranslatedBlock) -> str:
         """

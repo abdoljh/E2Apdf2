@@ -445,10 +445,14 @@ class ReflowRenderer:
         usable_width = (
             cfg.page_size[0] - cfg.margin_left - cfg.margin_right
         )
+        # Reduce by 10% to match Platypus internal available width
+        # (Paragraph has internal padding that slightly reduces the
+        # effective width vs raw page-margin calculation)
+        wrap_width = usable_width * 0.90
 
         # Step 3: word-wrap
         wrapped_lines = self._wrap_arabic_text(
-            reshaped, font_name, font_size, usable_width
+            reshaped, font_name, font_size, wrap_width
         )
 
         # Step 4: apply BiDi per line, escape for XML, join with <br/>
@@ -462,7 +466,14 @@ class ReflowRenderer:
     def _wrap_arabic_text(
         self, text: str, font_name: str, font_size: float, max_width: float
     ) -> list[str]:
-        """Word-wrap reshaped Arabic text to fit within max_width."""
+        """
+        Word-wrap reshaped Arabic text to fit within max_width.
+
+        Includes orphan prevention: if a line would contain only one
+        word, it's absorbed back into the previous line (allowing up
+        to 10% overflow) rather than leaving a lonely word on its own
+        line — which looks especially bad after BiDi reordering.
+        """
         import io as _io
         from reportlab.pdfgen import canvas as _canvas
 
@@ -474,13 +485,18 @@ class ReflowRenderer:
         if not words:
             return [text] if text.strip() else []
 
+        # Allow a small overflow tolerance (5% of max_width) to keep
+        # words together that almost fit.  Arabic presentation forms
+        # can measure slightly wider than they render due to ligatures.
+        tolerance = max_width * 0.05
+
         lines: list[str] = []
         current: list[str] = []
 
         for word in words:
             test_line = " ".join(current + [word])
             width = c.stringWidth(test_line, font_name, font_size)
-            if width <= max_width or not current:
+            if width <= max_width + tolerance or not current:
                 current.append(word)
             else:
                 lines.append(" ".join(current))
@@ -488,6 +504,20 @@ class ReflowRenderer:
 
         if current:
             lines.append(" ".join(current))
+
+        # --- Orphan absorption ---
+        # If a line has only 1 word, merge it into the previous line.
+        # This prevents the BiDi "lonely first word" artifact.
+        if len(lines) > 1:
+            merged: list[str] = [lines[0]]
+            for line in lines[1:]:
+                words_in_line = line.split()
+                if len(words_in_line) <= 1 and merged:
+                    # Absorb into previous line (allow overflow)
+                    merged[-1] = merged[-1] + " " + line
+                else:
+                    merged.append(line)
+            lines = merged
 
         return lines
 

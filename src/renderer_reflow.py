@@ -47,7 +47,7 @@ from reportlab.platypus import (
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-from .arabic_utils import prepare_arabic, has_arabic
+from .arabic_utils import prepare_arabic, has_arabic, reshape_arabic
 from .models import (
     ImageBlock,
     TranslatedBlock,
@@ -387,7 +387,12 @@ class ReflowRenderer:
         block_role = self._classify_block(tblock)
 
         if is_ar:
-            display_text = prepare_arabic(text)
+            # IMPORTANT: Only reshape (positional letter forms), do NOT
+            # apply BiDi reordering.  ReportLab's Paragraph with
+            # wordWrap='RTL' handles visual line ordering internally.
+            # Applying full BiDi here would reverse the entire paragraph
+            # string, causing last-sentence-first rendering.
+            display_text = reshape_arabic(text)
             style_key = {
                 "title": "ar_title",
                 "heading": "ar_heading",

@@ -90,17 +90,31 @@ class TextBlock:
     def full_text(self) -> str:
         if not self.spans:
             return ""
-        # Group spans into lines by similar y1 (top edge), then sort each
-        # line left-to-right and insert spaces where there is a visible gap.
-        # This handles character-level extraction where every glyph is its
-        # own span and uppercase/descender glyphs have slightly different y1.
-        line_height = max(s.font.size for s in self.spans)
-        tolerance = line_height * 0.5
-
+        # Use the block's overall height to estimate line height.
+        # With character-level spans, individual font.size values are
+        # unreliable (descenders like 'g' report ~14pt, 'a' reports ~7pt
+        # for the same 12pt line).  Instead, detect the actual line pitch
+        # from the Y-coordinate clusters.
         all_spans = sorted(self.spans, key=lambda s: -s.bbox.y1)
+
+        # --- Phase 1: cluster spans into lines by y1 proximity ---
+        # Use a generous tolerance: the max y1-spread within a single
+        # text line is about 1× the nominal font size (ascenders vs
+        # descenders).  We estimate nominal font size as the median
+        # span height, then allow 1.0× that as tolerance.
+        heights = sorted(s.bbox.height for s in all_spans if s.bbox.height > 0.5)
+        if heights:
+            nominal_size = heights[len(heights) // 2]
+        else:
+            nominal_size = 12.0
+        tolerance = max(nominal_size * 1.0, 8.0)
+
         lines: list[list[TextSpan]] = [[all_spans[0]]]
         for span in all_spans[1:]:
-            if abs(span.bbox.y1 - lines[-1][0].bbox.y1) <= tolerance:
+            # Compare against the MEAN y1 of the current line cluster
+            # (not just the first span) to avoid drift.
+            line_y1_mean = sum(s.bbox.y1 for s in lines[-1]) / len(lines[-1])
+            if abs(span.bbox.y1 - line_y1_mean) <= tolerance:
                 lines[-1].append(span)
             else:
                 lines.append([span])
@@ -112,7 +126,7 @@ class TextBlock:
             for i, span in enumerate(line):
                 if i > 0:
                     gap = span.bbox.x0 - line[i - 1].bbox.x1
-                    if gap > span.font.size * 0.4:
+                    if gap > nominal_size * 0.3:
                         parts.append(" ")
                 parts.append(span.text)
             line_texts.append("".join(parts))

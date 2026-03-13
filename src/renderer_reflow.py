@@ -334,22 +334,26 @@ class ReflowRenderer:
                     self._esc(marker), self._styles["divider"]
                 ))
 
-            # Text blocks — already in reading order from the extractor
-            # (sorted top-to-bottom, which is how they were extracted)
-            sorted_blocks = self._sort_blocks_reading_order(page)
+            # Build interleaved sequence of text and images
+            # sorted by Y-position (top-first)
+            elements = self._interleave_elements(page)
 
-            for tblock in sorted_blocks:
-                para = self._block_to_paragraph(tblock)
-                if para is not None:
-                    story.append(para)
-
-            # Images — after text for this source page
-            for img_block in page.image_blocks:
-                flowable = self._image_to_flowable(img_block)
-                if flowable is not None:
-                    story.append(Spacer(1, 6))
-                    story.append(flowable)
-                    story.append(Spacer(1, 6))
+            for element in elements:
+                if element["type"] == "text":
+                    para = self._block_to_paragraph(element["block"])
+                    if para is not None:
+                        story.append(para)
+                elif element["type"] == "image":
+                    flowable = self._image_to_flowable(element["image"])
+                    if flowable is not None:
+                        story.append(Spacer(1, 6))
+                        story.append(flowable)
+                        # Render caption if detected
+                        if element.get("caption"):
+                            cap_para = self._make_caption(element["caption"])
+                            if cap_para:
+                                story.append(cap_para)
+                        story.append(Spacer(1, 6))
 
         # Empty document guard
         if not story:
@@ -359,6 +363,180 @@ class ReflowRenderer:
             ))
 
         return story
+
+    def _interleave_elements(self, page: TranslatedPage) -> list[dict]:
+        """
+        Interleave text blocks and images by Y-position so images
+        appear at their correct location within the text flow.
+
+        Also detects captions: a text block immediately below an image
+        that is short (<150 chars) and has similar or smaller font size.
+
+        Returns a list of dicts:
+          {"type": "text", "block": TranslatedBlock}
+          {"type": "image", "image": ImageBlock, "caption": TranslatedBlock|None}
+        """
+        # --- Step 1: Merge overlapping images into groups ---
+        # Multiple images with identical/overlapping bboxes are parts
+        # of one composite visual (e.g., layered slide elements).
+        image_groups = self._group_overlapping_images(page.image_blocks)
+
+        # --- Step 2: Collect all elements with Y-position ---
+        items: list[tuple[float, str, object]] = []
+
+        # Text blocks
+        sorted_blocks = sorted(
+            page.translated_blocks,
+            key=lambda tb: -tb.original.bbox.y1,
+        )
+        for tb in sorted_blocks:
+            items.append((-tb.original.bbox.y1, "text", tb))
+
+        # Image groups (use the group's top Y for positioning)
+        for group in image_groups:
+            top_y1 = max(img.bbox.y1 for img in group)
+            items.append((-top_y1, "image_group", group))
+
+        # Sort by Y descending (top-first)
+        items.sort(key=lambda x: x[0])
+
+        # --- Step 3: Build interleaved sequence with caption detection ---
+        result: list[dict] = []
+        caption_indices: set[int] = set()  # Track text blocks used as captions
+
+        # First pass: identify captions
+        # A caption is a text block whose top (y1) is just below
+        # an image's bottom (y0), is short, and has modest font size.
+        text_block_list = list(sorted_blocks)
+
+        for group in image_groups:
+            bottom_y0 = min(img.bbox.y0 for img in group)
+            best_caption = None
+            best_gap = float("inf")
+
+            for idx, tb in enumerate(text_block_list):
+                if idx in caption_indices:
+                    continue
+                tb_y1 = tb.original.bbox.y1
+                gap = bottom_y0 - tb_y1  # Positive = text is below image
+
+                # Caption heuristic:
+                # - Text top is below image bottom (gap > 0)
+                # - Gap is small (within 2× the font size)
+                # - Text is short (< 150 chars)
+                # - Font size is not much larger than body
+                text = tb.translated_text.strip()
+                font_size = tb.font.size
+                median = self._median_font_size or 12.0
+
+                if (0 <= gap < font_size * 3
+                        and len(text) < 150
+                        and font_size <= median * 1.2
+                        and gap < best_gap):
+                    best_caption = idx
+                    best_gap = gap
+
+            if best_caption is not None:
+                caption_indices.add(best_caption)
+
+        # Second pass: build the interleaved list
+        # Re-iterate sorted items, attaching captions to their image groups
+        caption_map: dict[int, int] = {}  # image_group_idx → text_block_idx
+        for group_idx, group in enumerate(image_groups):
+            bottom_y0 = min(img.bbox.y0 for img in group)
+            best_caption = None
+            best_gap = float("inf")
+            for idx, tb in enumerate(text_block_list):
+                if idx in caption_indices:
+                    tb_y1 = tb.original.bbox.y1
+                    gap = bottom_y0 - tb_y1
+                    if 0 <= gap < best_gap:
+                        best_caption = idx
+                        best_gap = gap
+            if best_caption is not None:
+                caption_map[group_idx] = best_caption
+
+        for sort_key, item_type, item in items:
+            if item_type == "text":
+                # Skip if this text block is used as a caption
+                tb_idx = text_block_list.index(item) if item in text_block_list else -1
+                if tb_idx in caption_indices:
+                    continue
+                result.append({"type": "text", "block": item})
+
+            elif item_type == "image_group":
+                group = item
+                group_idx = image_groups.index(group)
+                # Pick the largest image from the group as the main visual
+                main_img = max(group, key=lambda img: len(img.image_bytes))
+                # Get caption if any
+                caption_tb = None
+                if group_idx in caption_map:
+                    caption_tb = text_block_list[caption_map[group_idx]]
+                result.append({
+                    "type": "image",
+                    "image": main_img,
+                    "caption": caption_tb,
+                })
+
+        return result
+
+    def _group_overlapping_images(
+        self, images: list[ImageBlock]
+    ) -> list[list[ImageBlock]]:
+        """
+        Group images that share the same (or nearly the same) bounding box.
+        These are typically layered elements composing one visual
+        (common in presentation PDFs).
+        """
+        if not images:
+            return []
+
+        groups: list[list[ImageBlock]] = []
+        used = set()
+
+        for i, img_a in enumerate(images):
+            if i in used:
+                continue
+            group = [img_a]
+            used.add(i)
+            for j, img_b in enumerate(images):
+                if j in used:
+                    continue
+                # Check if bboxes overlap significantly
+                overlap_x = (min(img_a.bbox.x1, img_b.bbox.x1)
+                             - max(img_a.bbox.x0, img_b.bbox.x0))
+                overlap_y = (min(img_a.bbox.y1, img_b.bbox.y1)
+                             - max(img_a.bbox.y0, img_b.bbox.y0))
+                if overlap_x > 0 and overlap_y > 0:
+                    overlap_area = overlap_x * overlap_y
+                    area_a = img_a.bbox.width * img_a.bbox.height
+                    area_b = img_b.bbox.width * img_b.bbox.height
+                    min_area = min(area_a, area_b) if min(area_a, area_b) > 0 else 1
+                    # >50% overlap = same group
+                    if overlap_area / min_area > 0.5:
+                        group.append(img_b)
+                        used.add(j)
+            groups.append(group)
+
+        return groups
+
+    def _make_caption(self, tblock: TranslatedBlock) -> Paragraph | None:
+        """Render a translated text block as a centered caption below an image."""
+        text = tblock.translated_text.strip()
+        if not text:
+            return None
+
+        is_ar = has_arabic(text)
+        if is_ar:
+            display_text = self._prepare_arabic_paragraph(text, "body")
+        else:
+            display_text = self._esc(text)
+
+        try:
+            return Paragraph(display_text, self._styles["caption"])
+        except Exception:
+            return None
 
     def _sort_blocks_reading_order(
         self, page: TranslatedPage

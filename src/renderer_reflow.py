@@ -329,9 +329,15 @@ class ReflowRenderer:
                     color=colors.Color(0.75, 0.75, 0.75),
                     spaceBefore=6, spaceAfter=2,
                 ))
-                marker = f"─── صفحة المصدر {page.page_number} ───"
+                # Apply full prepare_arabic (reshape + bidi) since this
+                # is a short single-line string, not a multi-sentence
+                # paragraph.  Without this, the Arabic text renders as
+                # disconnected reversed letters.
+                from .arabic_utils import prepare_arabic as _prep_ar
+                marker_text = f"─── صفحة المصدر {page.page_number} ───"
+                marker_display = _prep_ar(marker_text)
                 story.append(Paragraph(
-                    self._esc(marker), self._styles["divider"]
+                    self._esc(marker_display), self._styles["divider"]
                 ))
 
             # Build interleaved sequence of text and images

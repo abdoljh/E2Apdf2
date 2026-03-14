@@ -228,24 +228,150 @@ class PDFExtractor:
     # Shared: pypdf image extraction
     # ═══════════════════════════════════════════════════════════
     def _images_pypdf(self, page_idx, pw, ph):
-        if not self._current_pdf_path: return []
+        """
+        Extract images using pypdf's page.images API, with actual
+        positions parsed from the PDF content stream.
+        """
+        if not self._current_pdf_path:
+            return []
         images = []
         try:
             from pypdf import PdfReader
             reader = PdfReader(self._current_pdf_path)
-            if page_idx >= len(reader.pages): return []
-            for img_obj in reader.pages[page_idx].images:
+            if page_idx >= len(reader.pages):
+                return []
+
+            page = reader.pages[page_idx]
+
+            # Parse content stream to get image positions
+            img_positions = self._parse_image_positions(page, pw, ph)
+
+            for img_obj in page.images:
                 try:
                     img_data = img_obj.data
                     if len(img_data) > 10_000_000:
                         img_data, _ = self._downscale_image(img_data)
-                        if not img_data: continue
-                    if len(img_data) < 500: continue
-                    images.append(ImageBlock(image_bytes=img_data, bbox=BBox(pw*0.1,ph*0.25,pw*0.9,ph*0.75), extension="png"))
-                    logger.info(f"Extracted image {img_obj.name} p{page_idx+1} ({len(img_data)/1000:.0f}KB)")
-                except Exception as e: logger.warning(f"Image failed: {e}")
-        except: pass
+                        if not img_data:
+                            continue
+                    if len(img_data) < 500:
+                        continue
+
+                    # Look up actual position from content stream parse
+                    img_name = "/" + img_obj.name.split(".")[0]  # "/Img1.png" → "/Img1"
+                    if img_name in img_positions:
+                        bbox = img_positions[img_name]
+                    else:
+                        # Try without leading slash
+                        alt_name = img_obj.name.split(".")[0]
+                        bbox = img_positions.get(
+                            alt_name,
+                            BBox(pw * 0.1, ph * 0.25, pw * 0.9, ph * 0.75)
+                        )
+
+                    images.append(ImageBlock(
+                        image_bytes=img_data, bbox=bbox, extension="png",
+                    ))
+                    logger.info(
+                        f"Extracted image {img_obj.name} p{page_idx+1} "
+                        f"({len(img_data)/1000:.0f}KB) "
+                        f"at y={bbox.y0:.0f}-{bbox.y1:.0f}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Image failed: {e}")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.warning(f"pypdf image extraction failed: {e}")
         return images
+
+    def _parse_image_positions(self, page, pw, ph) -> dict[str, BBox]:
+        """
+        Parse the PDF page content stream to find actual image
+        placement coordinates.
+
+        Tracks the graphics state (q/Q save/restore, cm transforms)
+        and records where each image is placed via the Do operator.
+
+        Returns dict mapping image name (e.g. "/Img1") to BBox
+        in bottom-left origin coordinates.
+        """
+        import re
+        positions = {}
+
+        try:
+            contents = page["/Contents"]
+            if hasattr(contents, '__iter__') and not hasattr(contents, 'get_data'):
+                raw = b""
+                for c in contents:
+                    raw += c.get_object().get_data()
+            else:
+                raw = contents.get_object().get_data()
+            raw_str = raw.decode('latin-1', errors='replace')
+        except Exception:
+            return positions
+
+        # Track graphics state
+        ctm_stack = []
+        current_ctm = [1, 0, 0, 1, 0, 0]  # identity matrix [a,b,c,d,e,f]
+
+        for line in raw_str.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+
+            # Save graphics state
+            if line == 'q':
+                ctm_stack.append(list(current_ctm))
+                continue
+
+            # Restore graphics state
+            if line == 'Q':
+                if ctm_stack:
+                    current_ctm = ctm_stack.pop()
+                continue
+
+            # cm operator: concatenate transformation matrix
+            cm_match = re.match(
+                r'([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+'
+                r'([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+cm',
+                line,
+            )
+            if cm_match:
+                try:
+                    a, b, c, d, e, f = [float(x) for x in cm_match.groups()]
+                    ca, cb, cc, cd, ce, cf = current_ctm
+                    current_ctm = [
+                        a*ca + b*cc,
+                        a*cb + b*cd,
+                        c*ca + d*cc,
+                        c*cb + d*cd,
+                        e*ca + f*cc + ce,
+                        e*cb + f*cd + cf,
+                    ]
+                except ValueError:
+                    pass
+                continue
+
+            # Do operator: paint XObject (image)
+            do_match = re.match(r'(/\w+)\s+Do', line)
+            if do_match:
+                name = do_match.group(1)
+                a, b, c, d, e, f = current_ctm
+                # Image maps (0,0)-(1,1) → page coords via CTM
+                # Bottom-left of image: (e, f)
+                # Width = |a|, Height = |d| (for non-rotated images)
+                x0 = e
+                y0 = f
+                img_w = abs(a) if abs(a) > 1 else abs(c)
+                img_h = abs(d) if abs(d) > 1 else abs(b)
+                x1 = x0 + img_w
+                y1 = y0 + img_h
+
+                # Coordinates are already in PDF bottom-left origin
+                positions[name] = BBox(x0, y0, x1, y1)
+                continue
+
+        return positions
 
     # ═══════════════════════════════════════════════════════════
     # Shared utilities

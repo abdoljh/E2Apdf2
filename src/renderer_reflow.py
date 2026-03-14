@@ -143,7 +143,7 @@ class ReflowConfig:
 
     # Page layout
     page_size: tuple[float, float] = A4  # (width, height) in points
-    margin_left: float = 2.0 * cm
+    margin_left: float = 1.0 * cm
     margin_right: float = 2.0 * cm
     margin_top: float = 2.5 * cm
     margin_bottom: float = 2.0 * cm

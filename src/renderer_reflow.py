@@ -581,7 +581,17 @@ class ReflowRenderer:
             # string.  For a full paragraph, this puts the last sentence
             # first.  But for a single wrapped line, it correctly converts
             # logical order → visual order for RTL display.
-            display_text = self._prepare_arabic_paragraph(text, block_role)
+
+            # For titles and headings, try to fit on one line by shrinking
+            # the font size.  A single-line title avoids per-line BiDi
+            # ordering artifacts caused by leading numbers or hyphens.
+            fitted_size: float | None = None
+            if block_role in ("title", "heading"):
+                fitted_size = self._fit_text_to_line(text, block_role)
+
+            display_text = self._prepare_arabic_paragraph(
+                text, block_role, font_size_override=fitted_size
+            )
             style_key = {
                 "title": "ar_title",
                 "heading": "ar_heading",
@@ -590,9 +600,33 @@ class ReflowRenderer:
         else:
             display_text = self._esc(text)
             style_key = "en_body"
+            fitted_size = None
+
+        base_style = self._styles[style_key]
+
+        # Build a per-block style when the font was shrunk to fit one line.
+        cfg = self.config
+        if fitted_size is not None:
+            default_size = (
+                cfg.font_size * cfg.title_scale
+                if block_role == "title"
+                else cfg.font_size * cfg.heading_scale
+            )
+            if abs(fitted_size - default_size) > 0.1:
+                leading_scale = 1.3 if block_role == "title" else 1.35
+                style = ParagraphStyle(
+                    f"{base_style.name}_dyn",
+                    parent=base_style,
+                    fontSize=fitted_size,
+                    leading=fitted_size * leading_scale,
+                )
+            else:
+                style = base_style
+        else:
+            style = base_style
 
         try:
-            return Paragraph(display_text, self._styles[style_key])
+            return Paragraph(display_text, style)
         except Exception as e:
             logger.warning(f"Paragraph creation failed: {e}")
             safe = "".join(
@@ -600,11 +634,44 @@ class ReflowRenderer:
                 if unicodedata.category(ch)[0] != "C" or ch in "\n\r\t"
             )
             try:
-                return Paragraph(safe, self._styles[style_key])
+                return Paragraph(safe, style)
             except Exception:
                 return None
 
-    def _prepare_arabic_paragraph(self, text: str, role: str) -> str:
+    def _fit_text_to_line(self, text: str, role: str) -> float:
+        """
+        Return the largest font size ≤ the role default that fits *text*
+        on a single line within the current wrap width.  Never goes below
+        body font size so titles/headings keep visual hierarchy.
+        """
+        from .arabic_utils import reshape_arabic
+
+        cfg = self.config
+        font_name = self._font_bold
+        start_size = (
+            cfg.font_size * cfg.title_scale
+            if role == "title"
+            else cfg.font_size * cfg.heading_scale
+        )
+        min_size = cfg.font_size
+        usable_width = cfg.page_size[0] - cfg.margin_left - cfg.margin_right
+        max_width = usable_width * 0.90
+
+        reshaped = reshape_arabic(text)
+        buf = io.BytesIO()
+        from reportlab.pdfgen import canvas as _canvas
+        c = _canvas.Canvas(buf, pagesize=cfg.page_size)
+
+        size = start_size
+        while size > min_size:
+            if c.stringWidth(reshaped, font_name, size) <= max_width:
+                break
+            size -= 0.5
+        return max(size, min_size)
+
+    def _prepare_arabic_paragraph(
+        self, text: str, role: str, font_size_override: float | None = None
+    ) -> str:
         """
         Prepare Arabic text for a Platypus Paragraph:
         reshape → word-wrap → per-line BiDi → join with <br/>.
@@ -618,10 +685,18 @@ class ReflowRenderer:
         cfg = self.config
         if role == "title":
             font_name = self._font_bold
-            font_size = cfg.font_size * cfg.title_scale
+            font_size = (
+                font_size_override
+                if font_size_override is not None
+                else cfg.font_size * cfg.title_scale
+            )
         elif role == "heading":
             font_name = self._font_bold
-            font_size = cfg.font_size * cfg.heading_scale
+            font_size = (
+                font_size_override
+                if font_size_override is not None
+                else cfg.font_size * cfg.heading_scale
+            )
         else:
             font_name = self._font_reg
             font_size = cfg.font_size

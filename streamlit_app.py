@@ -99,16 +99,27 @@ with st.sidebar:
 
     backend = st.selectbox(
         "Translation backend",
-        options=["free", "mock", "google", "deepl", "llm-openai", "llm-anthropic"],
+        options=["free", "deep-google", "deep-mymemory", "mock",
+                 "google", "deepl", "llm-openai", "llm-anthropic"],
         format_func=lambda x: {
-            "free": "Free (Google Translate — no API key needed)",
+            "free": "Free (Google Translate — gtx endpoint)",
+            "deep-google": "Deep-Google (deep-translator, recommended free)",
+            "deep-mymemory": "Deep-MyMemory (deep-translator, no API key)",
             "mock": "Mock (pipeline test only — not a real translation)",
-            "google": "Google Cloud Translation",
-            "deepl": "DeepL",
-            "llm-openai": "OpenAI GPT",
-            "llm-anthropic": "Anthropic Claude",
+            "google": "Google Cloud Translation (API key required)",
+            "deepl": "DeepL (API key required)",
+            "llm-openai": "OpenAI GPT (API key required)",
+            "llm-anthropic": "Anthropic Claude (API key required)",
         }[x],
-        help="Choose the translation service. 'Free' uses Google Translate with no API key.",
+        help=(
+            "Choose the translation service.\n\n"
+            "**Free options** (no API key):\n"
+            "- *Free*: unofficial Google Translate gtx endpoint\n"
+            "- *Deep-Google*: deep-translator library (recommended)\n"
+            "- *Deep-MyMemory*: MyMemory translation service\n\n"
+            "**Paid options** (API key required):\n"
+            "- *Google Cloud*, *DeepL*, *OpenAI*, *Anthropic*"
+        ),
     )
 
     api_key = ""
@@ -121,7 +132,10 @@ with st.sidebar:
         "llm-anthropic": "ANTHROPIC_API_KEY",
     }
 
-    if backend not in ("mock", "free"):
+    # Backends that need NO API key
+    _NO_KEY_BACKENDS = ("mock", "free", "deep-google", "deep-mymemory")
+
+    if backend not in _NO_KEY_BACKENDS:
         env_hint = _ENV_VAR_HINTS.get(backend, "API_KEY")
         default_key = (
             st.secrets.get(env_hint, None)
@@ -209,7 +223,9 @@ with st.sidebar:
 # Active-backend indicator
 # ---------------------------------------------------------------------------
 _BACKEND_LABELS = {
-    "free": ("Free — Google Translate, no API key", "🆓"),
+    "free": ("Free — Google Translate (gtx), no API key", "🆓"),
+    "deep-google": ("Deep-Google — deep-translator library, no API key", "🟦"),
+    "deep-mymemory": ("Deep-MyMemory — MyMemory service, no API key", "🟦"),
     "mock": ("Mock — pipeline test only, not a real translation", "⚙️"),
     "google": ("Google Cloud Translation", "🔵"),
     "deepl": ("DeepL", "🟢"),
@@ -218,9 +234,14 @@ _BACKEND_LABELS = {
 }
 _label, _icon = _BACKEND_LABELS.get(backend, (backend, "🔧"))
 
-if backend in ("mock", "free"):
-    _note = " — produces placeholder text, not real Arabic." if backend == "mock" else " · real Arabic translation via Google Translate, no API key required."
-    st.info(f"{_icon} **Active backend:** {_label}{_note}", icon="ℹ️")
+if backend in _NO_KEY_BACKENDS:
+    _notes = {
+        "mock": " — produces placeholder text, not real Arabic.",
+        "free": " · real Arabic translation via Google Translate gtx, no API key required.",
+        "deep-google": " · recommended free option via deep-translator library.",
+        "deep-mymemory": " · MyMemory translation service, no API key required.",
+    }
+    st.info(f"{_icon} **Active backend:** {_label}{_notes.get(backend, '')}", icon="ℹ️")
 else:
     _key_source = ""
     _env_hint = _ENV_VAR_HINTS.get(backend, "API_KEY")
@@ -254,7 +275,7 @@ if uploaded_file is not None:
     st.success(f"File loaded: **{uploaded_file.name}** ({uploaded_file.size:,} bytes)")
 
     if st.button("Translate to Arabic", type="primary", use_container_width=True):
-        if backend not in ("mock", "free") and not api_key.strip():
+        if backend not in _NO_KEY_BACKENDS and not api_key.strip():
             st.error(
                 f"Please enter your API key for the **{backend}** backend "
                 "(or set the corresponding environment variable)."

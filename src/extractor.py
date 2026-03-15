@@ -135,9 +135,12 @@ class PDFExtractor:
         return doc
 
     def _images_pymupdf(self, pdf, page, page_idx, pw, ph):
-        # Build xref→bbox map from get_image_info() (direct placements only).
-        # Images inside form XObjects won't appear here; they get unique
-        # fallback positions so they are not incorrectly merged.
+        import fitz
+        from collections import defaultdict
+
+        # 1. Build xref→on-page-bbox map from get_image_info().
+        #    Since PyMuPDF ≥ 1.18.11 this also covers images inside form
+        #    XObjects, so we get accurate on-page positions for all images.
         bbox_map: dict[int, BBox] = {}
         try:
             for info in page.get_image_info():
@@ -148,12 +151,24 @@ class PDFExtractor:
         except Exception:
             pass
 
-        images = []
+        # 2. Collect all images, dedup by xref, and bucket by referencer.
+        #    The `referencer` field (img_info[9]) is the xref of the form
+        #    XObject that directly contains the image.  referencer=0 means
+        #    the image is painted directly on the page content stream.
+        #
+        #    Images that share a non-zero referencer are sub-elements of the
+        #    same composite figure (e.g. logos inside a "Figure 2" XObject).
+        #    We render such groups as a single region pixmap instead of
+        #    extracting each sub-image individually.
+        Entry = tuple  # (xref, img_bytes, ext, bbox_or_None)
+        by_referencer: dict[int, list[Entry]] = defaultdict(list)
         seen_xrefs: set[int] = set()
+
         for img_info in page.get_images(full=True):
-            xref = img_info[0]
+            xref      = img_info[0]
+            referencer = img_info[9]
             if xref in seen_xrefs:
-                continue  # Same resource referenced multiple times – show once
+                continue
             seen_xrefs.add(xref)
             try:
                 base = pdf.extract_image(xref)
@@ -167,25 +182,87 @@ class PDFExtractor:
                     img_bytes, ext = self._downscale_image(img_bytes)
                     if not img_bytes:
                         continue
-                if xref in bbox_map:
-                    bbox = bbox_map[xref]
-                else:
-                    # Image is inside a nested XObject – assign a unique
-                    # vertical slot so these images don't all collapse to
-                    # the same bbox and get incorrectly grouped together.
+                bbox = bbox_map.get(xref)          # None if not positioned
+                by_referencer[referencer].append((xref, img_bytes, ext, bbox))
+            except Exception as e:
+                logger.debug(f"Image xref={xref} failed: {e}")
+
+        # 3. Produce final ImageBlock list.
+        images: list[ImageBlock] = []
+
+        for referencer, entries in by_referencer.items():
+            # Single image OR directly-placed images → extract individually.
+            if referencer == 0 or len(entries) == 1:
+                for xref, img_bytes, ext, bbox in entries:
+                    if bbox is None:
+                        idx = len(images)
+                        y1 = ph * (0.9 - 0.15 * idx)
+                        y0 = max(0.0, y1 - ph * 0.4)
+                        bbox = BBox(pw * 0.1, y0, pw * 0.9, y1)
+                    images.append(ImageBlock(
+                        image_bytes=img_bytes, bbox=bbox,
+                        extension=ext, xref=xref,
+                    ))
+                    logger.info(
+                        f"Extracted image xref={xref} p{page_idx+1} "
+                        f"({len(img_bytes)/1000:.0f}KB)"
+                    )
+                continue
+
+            # Multiple images inside the same form XObject.
+            # If we have on-page positions for at least 2 of them, render
+            # the union region as a single composite pixmap.  Use the
+            # referencer's xref as the ImageBlock xref so that the
+            # cross-page dedup correctly removes header/footer composites
+            # (same form XObject used on every page) while keeping unique
+            # figures (used only on one page).
+            positioned = [(xref, bbox) for xref, _, _, bbox in entries
+                          if bbox is not None]
+
+            if len(positioned) >= 2:
+                all_bboxes = [bbox for _, bbox in positioned]
+                pad = 4.0
+                x0 = max(0.0, min(b.x0 for b in all_bboxes) - pad)
+                y0 = max(0.0, min(b.y0 for b in all_bboxes) - pad)
+                x1 = min(pw,  max(b.x1 for b in all_bboxes) + pad)
+                y1 = min(ph,  max(b.y1 for b in all_bboxes) + pad)
+                # PyMuPDF clip uses top-left origin
+                clip = fitz.Rect(x0, ph - y1, x1, ph - y0)
+                try:
+                    pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+                    comp_bytes = pixmap.tobytes("png")
+                    if len(comp_bytes) > 10_000_000:
+                        comp_bytes, _ = self._downscale_image(comp_bytes)
+                    images.append(ImageBlock(
+                        image_bytes=comp_bytes,
+                        bbox=BBox(x0, y0, x1, y1),
+                        extension="png",
+                        xref=referencer,   # ← key: enables cross-page dedup
+                    ))
+                    logger.info(
+                        f"Rendered {len(entries)}-image form XObject "
+                        f"xref={referencer} as composite p{page_idx+1}"
+                    )
+                    continue
+                except Exception as e:
+                    logger.warning(
+                        f"Composite render failed (referencer={referencer}): {e}"
+                    )
+                    # Fall through to individual extraction below
+
+            # Fallback: no position info or composite render failed →
+            # extract individually with unique vertical fallback slots.
+            for xref, img_bytes, ext, bbox in entries:
+                if bbox is None:
                     idx = len(images)
                     y1 = ph * (0.9 - 0.15 * idx)
                     y0 = max(0.0, y1 - ph * 0.4)
                     bbox = BBox(pw * 0.1, y0, pw * 0.9, y1)
                 images.append(ImageBlock(
-                    image_bytes=img_bytes, bbox=bbox, extension=ext, xref=xref,
+                    image_bytes=img_bytes, bbox=bbox,
+                    extension=ext, xref=xref,
                 ))
-                logger.info(
-                    f"Extracted image xref={xref} p{page_idx+1} "
-                    f"({len(img_bytes)/1000:.0f}KB) positioned={xref in bbox_map}"
-                )
-            except Exception as e:
-                logger.debug(f"Image xref={xref} failed: {e}")
+
         return images
 
     # ═══════════════════════════════════════════════════════════

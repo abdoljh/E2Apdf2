@@ -253,11 +253,15 @@ class PDFExtractor:
         from collections import defaultdict
 
         # 1. Build xref→on-page-bbox map from get_image_info().
-        #    Since PyMuPDF ≥ 1.18.11 this also covers images inside form
-        #    XObjects, so we get accurate on-page positions for all images.
+        #    xrefs=True (PyMuPDF ≥ 1.23.3) resolves the xref for images
+        #    inside nested form XObjects, which otherwise return xref=0.
         bbox_map: dict[int, BBox] = {}
         try:
-            for info in page.get_image_info():
+            try:
+                img_infos = page.get_image_info(xrefs=True)
+            except TypeError:
+                img_infos = page.get_image_info()
+            for info in img_infos:
                 xref = info.get("xref", 0)
                 if xref and xref not in bbox_map:
                     b = info["bbox"]

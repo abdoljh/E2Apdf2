@@ -105,20 +105,16 @@ class PDFExtractor:
                     doc.pages.append(PageContent(page_number=page_idx+1, width=p.rect.width, height=p.rect.height))
                 except:
                     doc.pages.append(PageContent(page_number=page_idx+1, width=612, height=792))
-        pdf.close()
-
-        # ── Cross-page deduplication ────────────────────────────────────
+        # ── Cross-page deduplication (PDF still open) ───────────────────
         # Any image xref that appears on MORE THAN ONE page is a template
-        # element (header logo, footer watermark, background graphic) that
-        # was placed via a shared form XObject.  page.get_images(full=True)
-        # surfaces these on every page, but they are not unique content and
-        # should not flood the translated output.  Remove them from all pages.
+        # element (header logo, footer watermark, background graphic).
+        # Remove before spatial clustering so only unique content remains.
         from collections import Counter
         xref_counts: Counter = Counter(
             img.xref
             for pc in doc.pages
             for img in pc.image_blocks
-            if img.xref  # xref=0 are inline images; handled separately
+            if img.xref
         )
         repeated_xrefs = {x for x, c in xref_counts.items() if c > 1}
         if repeated_xrefs:
@@ -132,7 +128,125 @@ class PDFExtractor:
                     if img.xref not in repeated_xrefs
                 ]
 
+        # ── Spatial clustering (PDF still open) ─────────────────────────
+        # Each logo inside a composite figure (e.g. Figure 2 on page 3) is
+        # its OWN form XObject with a unique referencer, so the referencer-
+        # based grouping in _images_pymupdf cannot merge them.  Now that
+        # header/template images have been removed, spatially adjacent
+        # images on the same page are sub-elements of the same figure and
+        # should be rendered as one composite pixmap.
+        for page_idx, pc in enumerate(doc.pages):
+            if len(pc.image_blocks) >= 2:
+                try:
+                    page = pdf[page_idx]
+                    pc.image_blocks = self._spatially_cluster_images(
+                        page, pc.image_blocks, pc.width, pc.height
+                    )
+                except Exception as e:
+                    logger.warning(f"Spatial clustering p{page_idx+1}: {e}")
+
+        pdf.close()
         return doc
+
+    # ------------------------------------------------------------------
+    def _spatially_cluster_images(
+        self, page, images: list, pw: float, ph: float
+    ) -> list:
+        """
+        Cluster images that are spatially adjacent (gap ≤ MAX_GAP on both
+        axes) and render each cluster as a single composite pixmap.
+
+        This handles figures whose sub-images (e.g. company logos inside
+        Figure 2) are each in their own separate form XObject and therefore
+        have distinct referencers — they cannot be grouped by the
+        referencer-based logic but they ARE spatially co-located.
+
+        Images with fallback bboxes (nearly full-page width) are excluded
+        from clustering; they are kept as individual fallback entries.
+        """
+        import fitz
+
+        MAX_GAP = 50  # points — gap threshold for "same figure"
+
+        # Split into cluster-eligible (properly positioned) vs fallback.
+        # Fallback bboxes have x0 ≈ pw*0.1, x1 ≈ pw*0.9 (assigned when the
+        # image position is unknown).  Use a 10-pt tolerance to detect them.
+        def is_fallback(img) -> bool:
+            return (abs(img.bbox.x0 - pw * 0.1) < 10
+                    and abs(img.bbox.x1 - pw * 0.9) < 10)
+
+        eligible   = [img for img in images if not is_fallback(img)]
+        ineligible = [img for img in images if     is_fallback(img)]
+
+        if len(eligible) <= 1:
+            return images   # nothing to cluster
+
+        # Union-Find over eligible images
+        n = len(eligible)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: int, y: int) -> None:
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        for i in range(n):
+            a = eligible[i]
+            for j in range(i + 1, n):
+                b = eligible[j]
+                gap_x = max(0.0, max(a.bbox.x0, b.bbox.x0)
+                            - min(a.bbox.x1, b.bbox.x1))
+                gap_y = max(0.0, max(a.bbox.y0, b.bbox.y0)
+                            - min(a.bbox.y1, b.bbox.y1))
+                if gap_x <= MAX_GAP and gap_y <= MAX_GAP:
+                    union(i, j)
+
+        # Group images by cluster root
+        from collections import defaultdict
+        clusters: dict[int, list] = defaultdict(list)
+        for i, img in enumerate(eligible):
+            clusters[find(i)].append(img)
+
+        result: list = []
+        for cluster_imgs in clusters.values():
+            if len(cluster_imgs) == 1:
+                result.append(cluster_imgs[0])
+                continue
+
+            # Render the union bbox of the cluster as one composite pixmap
+            pad = 4.0
+            x0 = max(0.0, min(img.bbox.x0 for img in cluster_imgs) - pad)
+            y0 = max(0.0, min(img.bbox.y0 for img in cluster_imgs) - pad)
+            x1 = min(pw,  max(img.bbox.x1 for img in cluster_imgs) + pad)
+            y1 = min(ph,  max(img.bbox.y1 for img in cluster_imgs) + pad)
+            clip = fitz.Rect(x0, ph - y1, x1, ph - y0)
+            try:
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+                comp_bytes = pixmap.tobytes("png")
+                if len(comp_bytes) > 10_000_000:
+                    comp_bytes, _ = self._downscale_image(comp_bytes)
+                result.append(ImageBlock(
+                    image_bytes=comp_bytes,
+                    bbox=BBox(x0, y0, x1, y1),
+                    extension="png",
+                    xref=0,
+                ))
+                logger.info(
+                    f"Spatial cluster: merged {len(cluster_imgs)} images "
+                    f"into composite at ({x0:.0f},{y0:.0f})-({x1:.0f},{y1:.0f})"
+                )
+            except Exception as e:
+                logger.warning(f"Spatial composite render failed: {e}")
+                result.extend(cluster_imgs)   # keep individuals on failure
+
+        result.extend(ineligible)
+        return result
 
     def _images_pymupdf(self, pdf, page, page_idx, pw, ph):
         import fitz

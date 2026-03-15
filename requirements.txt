@@ -1,7 +1,7 @@
 streamlit>=1.32.0
 pypdfium2>=4.0
 pypdf>=3.0
-PyMuPDF>=1.23.0
+PyMuPDF>=1.27.0
 reportlab>=4.0
 deep-translator>=1.11.0
 arabic-reshaper>=3.0

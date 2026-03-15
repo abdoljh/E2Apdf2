@@ -473,17 +473,23 @@ class ReflowRenderer:
             elif item_type == "image_group":
                 group = item
                 group_idx = image_groups.index(group)
-                # Pick the largest image from the group as the main visual
-                main_img = max(group, key=lambda img: len(img.image_bytes))
-                # Get caption if any
+                # Get caption if any (attached to the last image in group)
                 caption_tb = None
                 if group_idx in caption_map:
                     caption_tb = text_block_list[caption_map[group_idx]]
-                result.append({
-                    "type": "image",
-                    "image": main_img,
-                    "caption": caption_tb,
-                })
+                # Render every image in the group so that images stacked
+                # in the source PDF ("hidden beneath" others) are not lost.
+                # Sort largest-first so the dominant visual leads.
+                sorted_group = sorted(
+                    group, key=lambda img: len(img.image_bytes), reverse=True
+                )
+                for k, img in enumerate(sorted_group):
+                    result.append({
+                        "type": "image",
+                        "image": img,
+                        # Caption only on the last image of the group
+                        "caption": caption_tb if k == len(sorted_group) - 1 else None,
+                    })
 
         return result
 
@@ -501,6 +507,7 @@ class ReflowRenderer:
         groups: list[list[ImageBlock]] = []
         used = set()
 
+        _TOL = 8  # points – tolerance for "same bbox"
         for i, img_a in enumerate(images):
             if i in used:
                 continue
@@ -509,23 +516,17 @@ class ReflowRenderer:
             for j, img_b in enumerate(images):
                 if j in used:
                     continue
-                # Check if bboxes overlap significantly
-                overlap_x = (min(img_a.bbox.x1, img_b.bbox.x1)
-                             - max(img_a.bbox.x0, img_b.bbox.x0))
-                overlap_y = (min(img_a.bbox.y1, img_b.bbox.y1)
-                             - max(img_a.bbox.y0, img_b.bbox.y0))
-                if overlap_x > 0 and overlap_y > 0:
-                    overlap_area = overlap_x * overlap_y
-                    area_a = img_a.bbox.width * img_a.bbox.height
-                    area_b = img_b.bbox.width * img_b.bbox.height
-                    area_a = area_a if area_a > 0 else 1
-                    area_b = area_b if area_b > 0 else 1
-                    # Both images must overlap each other by >50% of their
-                    # own area (bidirectional).  This avoids a large
-                    # background image absorbing all smaller images on top.
-                    if overlap_area / area_a > 0.5 and overlap_area / area_b > 0.5:
-                        group.append(img_b)
-                        used.add(j)
+                # Only group images whose bboxes are nearly identical –
+                # these are genuine layered composites (e.g. presentation
+                # slides where transparent layers share the same canvas).
+                # Larger overlaps that don't meet this strict test are
+                # distinct images that merely happen to share space.
+                if (abs(img_a.bbox.x0 - img_b.bbox.x0) <= _TOL
+                        and abs(img_a.bbox.y0 - img_b.bbox.y0) <= _TOL
+                        and abs(img_a.bbox.x1 - img_b.bbox.x1) <= _TOL
+                        and abs(img_a.bbox.y1 - img_b.bbox.y1) <= _TOL):
+                    group.append(img_b)
+                    used.add(j)
             groups.append(group)
 
         return groups

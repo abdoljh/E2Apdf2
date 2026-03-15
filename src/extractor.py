@@ -109,34 +109,58 @@ class PDFExtractor:
         return doc
 
     def _images_pymupdf(self, pdf, page, page_idx, pw, ph):
-        import fitz
+        # Build xref→bbox map from get_image_info() (direct placements only).
+        # Images inside form XObjects won't appear here; they get unique
+        # fallback positions so they are not incorrectly merged.
+        bbox_map: dict[int, BBox] = {}
+        try:
+            for info in page.get_image_info():
+                xref = info.get("xref", 0)
+                if xref and xref not in bbox_map:
+                    b = info["bbox"]
+                    bbox_map[xref] = BBox(b[0], ph - b[3], b[2], ph - b[1])
+        except Exception:
+            pass
+
         images = []
+        seen_xrefs: set[int] = set()
         for img_info in page.get_images(full=True):
             xref = img_info[0]
+            if xref in seen_xrefs:
+                continue  # Same resource referenced multiple times – show once
+            seen_xrefs.add(xref)
             try:
                 base = pdf.extract_image(xref)
-                if not base: continue
+                if not base:
+                    continue
                 img_bytes = base["image"]
                 ext = base.get("ext", "png")
-                if len(img_bytes) < 500: continue
+                if len(img_bytes) < 500:
+                    continue
                 if len(img_bytes) > 10_000_000:
                     img_bytes, ext = self._downscale_image(img_bytes)
-                    if not img_bytes: continue
-                bbox = self._image_bbox_pymupdf(page, xref, pw, ph)
-                images.append(ImageBlock(image_bytes=img_bytes, bbox=bbox, extension=ext, xref=xref))
-                logger.info(f"Extracted image xref={xref} p{page_idx+1} ({len(img_bytes)/1000:.0f}KB)")
+                    if not img_bytes:
+                        continue
+                if xref in bbox_map:
+                    bbox = bbox_map[xref]
+                else:
+                    # Image is inside a nested XObject – assign a unique
+                    # vertical slot so these images don't all collapse to
+                    # the same bbox and get incorrectly grouped together.
+                    idx = len(images)
+                    y1 = ph * (0.9 - 0.15 * idx)
+                    y0 = max(0.0, y1 - ph * 0.4)
+                    bbox = BBox(pw * 0.1, y0, pw * 0.9, y1)
+                images.append(ImageBlock(
+                    image_bytes=img_bytes, bbox=bbox, extension=ext, xref=xref,
+                ))
+                logger.info(
+                    f"Extracted image xref={xref} p{page_idx+1} "
+                    f"({len(img_bytes)/1000:.0f}KB) positioned={xref in bbox_map}"
+                )
             except Exception as e:
                 logger.debug(f"Image xref={xref} failed: {e}")
         return images
-
-    def _image_bbox_pymupdf(self, page, xref, pw, ph):
-        try:
-            for img in page.get_image_info():
-                if img.get("xref") == xref:
-                    b = img["bbox"]
-                    return BBox(b[0], ph - b[3], b[2], ph - b[1])
-        except: pass
-        return BBox(pw*0.1, ph*0.25, pw*0.9, ph*0.75)
 
     # ═══════════════════════════════════════════════════════════
     # Backend 2: pypdfium2

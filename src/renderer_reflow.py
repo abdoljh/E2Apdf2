@@ -350,7 +350,9 @@ class ReflowRenderer:
                     if para is not None:
                         story.append(para)
                 elif element["type"] == "image":
-                    flowable = self._image_to_flowable(element["image"])
+                    flowable = self._image_to_flowable(
+                        element["image"], source_page_h=page.height
+                    )
                     if flowable is not None:
                         story.append(Spacer(1, 6))
                         story.append(flowable)
@@ -821,14 +823,23 @@ class ReflowRenderer:
         mid = len(sizes) // 2
         return sizes[mid]
 
-    def _image_to_flowable(self, img_block: ImageBlock) -> RLImage | None:
-        """Convert an ImageBlock to a Platypus Image flowable."""
+    def _image_to_flowable(
+        self,
+        img_block: ImageBlock,
+        source_page_h: float = 0.0,
+    ) -> RLImage | None:
+        """Convert an ImageBlock to a Platypus Image flowable.
+
+        Header/footer icons and visually small images are capped at their
+        source-PDF bbox size so a high-resolution icon (e.g. 200×200 px
+        rendered as a 30 pt logo) does not balloon to full page width.
+        """
         if not img_block.image_bytes:
             return None
 
         try:
             img_io = io.BytesIO(img_block.image_bytes)
-            # Determine natural dimensions
+            # Determine natural pixel dimensions
             try:
                 from PIL import Image as PILImage
                 with PILImage.open(io.BytesIO(img_block.image_bytes)) as pil:
@@ -852,12 +863,34 @@ class ReflowRenderer:
                 - self.config.margin_bottom
             ) * 0.55
 
-            aspect = nat_h / nat_w
-            disp_w = min(nat_w, usable_w)
-            disp_h = disp_w * aspect
+            src_w = img_block.bbox.width
+            src_h = img_block.bbox.height
+
+            # Detect header (top 15%) / footer (bottom 10%) placement and
+            # small icons based on their source-PDF bbox size.
+            in_header = (source_page_h > 0
+                         and img_block.bbox.y1 > source_page_h * 0.85)
+            in_footer = (source_page_h > 0
+                         and img_block.bbox.y0 < source_page_h * 0.10)
+            is_icon   = src_w > 0 and src_h > 0 and (
+                src_w < 100 or src_h < 80
+            )
+
+            if (in_header or in_footer or is_icon) and src_w > 0 and src_h > 0:
+                # Respect the size the image occupied in the source PDF.
+                # Allow a small upscale (max 1.5×) to keep icons visible,
+                # but never balloon them to full page width.
+                max_icon_w = min(src_w * 1.5, usable_w * 0.4)
+                disp_w = min(nat_w, max_icon_w)
+                disp_h = disp_w * (src_h / src_w)
+            else:
+                aspect = nat_h / nat_w
+                disp_w = min(nat_w, usable_w)
+                disp_h = disp_w * aspect
+
             if disp_h > usable_h:
                 disp_h = usable_h
-                disp_w = disp_h / aspect
+                disp_w = disp_h * (src_w / src_h) if src_h > 0 else disp_h
 
             return RLImage(img_io, width=disp_w, height=disp_h)
         except Exception as e:

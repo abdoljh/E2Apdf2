@@ -475,23 +475,19 @@ class ReflowRenderer:
             elif item_type == "image_group":
                 group = item
                 group_idx = image_groups.index(group)
-                # Get caption if any (attached to the last image in group)
+                # Pick the largest image from the group as the main visual.
+                # The group only contains truly layered composites (bboxes
+                # within 8pt of each other), so the largest represents the
+                # dominant / top-most layer.
+                main_img = max(group, key=lambda img: len(img.image_bytes))
                 caption_tb = None
                 if group_idx in caption_map:
                     caption_tb = text_block_list[caption_map[group_idx]]
-                # Render every image in the group so that images stacked
-                # in the source PDF ("hidden beneath" others) are not lost.
-                # Sort largest-first so the dominant visual leads.
-                sorted_group = sorted(
-                    group, key=lambda img: len(img.image_bytes), reverse=True
-                )
-                for k, img in enumerate(sorted_group):
-                    result.append({
-                        "type": "image",
-                        "image": img,
-                        # Caption only on the last image of the group
-                        "caption": caption_tb if k == len(sorted_group) - 1 else None,
-                    })
+                result.append({
+                    "type": "image",
+                    "image": main_img,
+                    "caption": caption_tb,
+                })
 
         return result
 
@@ -826,13 +822,16 @@ class ReflowRenderer:
     def _image_to_flowable(
         self,
         img_block: ImageBlock,
-        source_page_h: float = 0.0,
+        source_page_h: float = 0.0,  # kept for API compatibility
     ) -> RLImage | None:
         """Convert an ImageBlock to a Platypus Image flowable.
 
-        Header/footer icons and visually small images are capped at their
-        source-PDF bbox size so a high-resolution icon (e.g. 200×200 px
-        rendered as a 30 pt logo) does not balloon to full page width.
+        Display size = min(natural_px, source_bbox_pts, usable_width).
+
+        Using the source bbox as an upper bound ensures that a high-res
+        icon (e.g. 200 px rendered as a 30 pt header logo) never balloons
+        to full page width.  Content images whose source bbox already
+        fills the page scale normally up to 80 % of usable width.
         """
         if not img_block.image_bytes:
             return None
@@ -851,7 +850,7 @@ class ReflowRenderer:
             if nat_w <= 0 or nat_h <= 0:
                 return None
 
-            # Scale to fit 80% of usable width, max 55% of page height
+            # Maximum display dimensions (80 % of usable width, 55 % of height)
             usable_w = (
                 self.config.page_size[0]
                 - self.config.margin_left
@@ -866,31 +865,20 @@ class ReflowRenderer:
             src_w = img_block.bbox.width
             src_h = img_block.bbox.height
 
-            # Detect header (top 15%) / footer (bottom 10%) placement and
-            # small icons based on their source-PDF bbox size.
-            in_header = (source_page_h > 0
-                         and img_block.bbox.y1 > source_page_h * 0.85)
-            in_footer = (source_page_h > 0
-                         and img_block.bbox.y0 < source_page_h * 0.10)
-            is_icon   = src_w > 0 and src_h > 0 and (
-                src_w < 100 or src_h < 80
-            )
-
-            if (in_header or in_footer or is_icon) and src_w > 0 and src_h > 0:
-                # Respect the size the image occupied in the source PDF.
-                # Allow a small upscale (max 1.5×) to keep icons visible,
-                # but never balloon them to full page width.
-                max_icon_w = min(src_w * 1.5, usable_w * 0.4)
-                disp_w = min(nat_w, max_icon_w)
-                disp_h = disp_w * (src_h / src_w)
+            # Cap display width to the size the image occupied in the source
+            # PDF (when that information is reliable, i.e. src_w > 5 pt).
+            # This prevents small header/footer icons from ballooning.
+            if src_w > 5:
+                disp_w = min(nat_w, src_w, usable_w)
             else:
-                aspect = nat_h / nat_w
                 disp_w = min(nat_w, usable_w)
-                disp_h = disp_w * aspect
 
+            # Preserve natural aspect ratio for the height
+            aspect = nat_h / nat_w
+            disp_h = disp_w * aspect
             if disp_h > usable_h:
                 disp_h = usable_h
-                disp_w = disp_h * (src_w / src_h) if src_h > 0 else disp_h
+                disp_w = disp_h / aspect
 
             return RLImage(img_io, width=disp_w, height=disp_h)
         except Exception as e:

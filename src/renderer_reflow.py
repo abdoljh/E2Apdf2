@@ -518,9 +518,12 @@ class ReflowRenderer:
                     overlap_area = overlap_x * overlap_y
                     area_a = img_a.bbox.width * img_a.bbox.height
                     area_b = img_b.bbox.width * img_b.bbox.height
-                    min_area = min(area_a, area_b) if min(area_a, area_b) > 0 else 1
-                    # >50% overlap = same group
-                    if overlap_area / min_area > 0.5:
+                    area_a = area_a if area_a > 0 else 1
+                    area_b = area_b if area_b > 0 else 1
+                    # Both images must overlap each other by >50% of their
+                    # own area (bidirectional).  This avoids a large
+                    # background image absorbing all smaller images on top.
+                    if overlap_area / area_a > 0.5 and overlap_area / area_b > 0.5:
                         group.append(img_b)
                         used.add(j)
             groups.append(group)

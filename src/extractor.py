@@ -106,6 +106,32 @@ class PDFExtractor:
                 except:
                     doc.pages.append(PageContent(page_number=page_idx+1, width=612, height=792))
         pdf.close()
+
+        # ── Cross-page deduplication ────────────────────────────────────
+        # Any image xref that appears on MORE THAN ONE page is a template
+        # element (header logo, footer watermark, background graphic) that
+        # was placed via a shared form XObject.  page.get_images(full=True)
+        # surfaces these on every page, but they are not unique content and
+        # should not flood the translated output.  Remove them from all pages.
+        from collections import Counter
+        xref_counts: Counter = Counter(
+            img.xref
+            for pc in doc.pages
+            for img in pc.image_blocks
+            if img.xref  # xref=0 are inline images; handled separately
+        )
+        repeated_xrefs = {x for x, c in xref_counts.items() if c > 1}
+        if repeated_xrefs:
+            logger.info(
+                f"Removing {len(repeated_xrefs)} repeated template image(s) "
+                f"(xrefs: {repeated_xrefs})"
+            )
+            for pc in doc.pages:
+                pc.image_blocks = [
+                    img for img in pc.image_blocks
+                    if img.xref not in repeated_xrefs
+                ]
+
         return doc
 
     def _images_pymupdf(self, pdf, page, page_idx, pw, ph):
